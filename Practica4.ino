@@ -1,176 +1,172 @@
-// LIBRERIAS
 #include <Controllino.h>
-#include "Stone_HMI_Define.h" // Librería oficial de HMI Stone
-#include "Procesar_HMI.h"     // Librería implementada para procesar respuestas del HMI
+#include "Stone_HMI_Define.h"
+#include "Procesar_HMI.h"
 
-// --- VARIABLES DE CONTROL Y ESTADO ---
-const int pin_motor = CONTROLLINO_D0; // Pin de salida PWM al motor
-bool is_running = false;              // Estado del motor (true=corriendo, false=parado)
+// ==== PARÁMETROS PID ====
+float salidaPID = 0;
+// Variables globales para las ganancias (protegidas)
+float Kp = 0.0;
+float Ki = 0.0;
+float Kd = 0.0;
+const float Ts = 0.05;       // 50 ms (Frecuencia de control de 20 Hz)
+float errorPID[3] = {0, 0, 0};
 
-// --- VARIABLES DE SETPOINT (HMI) ---
-float setpoint_rpm = 0; // RPM deseadas (leído del slider1, 0-5000)
-char label12_text[10];  // Char para mostrar el Setpoint en el label12
+// ==== MOTOR Y HMI ====
+const int pinPWM = CONTROLLINO_D0;
+int referenciaRPM = 0;       // 0-5000 RPM
+char txt_setpoint[10];
+char txt_rpm[10];
+char txt_pwm[10];
 
-// --- VARIABLES DE MEDICIÓN (RPM) ---
-const int entrada = CONTROLLINO_IN1;                       // Pin de entrada de pulsos
-volatile unsigned long conteo_pulsos = 0;                  // Contador de pulsos
-float rpm = 0;                                             // RPM calculadas
-char label4_text[10];                                      // Char para mostrar las RPM en el label4
-const uint16_t PULSOS_POR_REV = 36;                        // Pulsos por revolución
-const float fs = 1;                                        // Frecuencia de muestreo (1 Hz)
+// ==== ENCODER ====
+const int pinEncoder = CONTROLLINO_IN1;
+volatile unsigned long pulsos = 0;
+float velocidadRPM = 0;
+const uint16_t PPR = 36;
+const float fs = 1.0 / Ts; // fs = 20 Hz
 
-// --- VARIABLES DEL PID ---
-// Constantes (leídas de la HMI)
-float Kp = 1.0; // Ganancia Proporcional (desde spin_box1)
-float Ki = 0.5; // Ganancia Integral (desde spin_box2)
-float Kd = 0.1; // Ganancia Derivativa (desde spin_box3)
+// ==== TIEMPOS ====
+unsigned long t_lecturaHMI = 0;
+unsigned long t_envioHMI = 0;
 
-// Variables de cálculo del PID
-float error = 0;
-float integral = 0;
-float derivative = 0;
-float last_error = 0;
-float output_pid = 0; // Salida del PID (0-255)
-const float pid_min = 0;
-const float pid_max = 255;
+// ==== PROTOTIPO ====
+void ISR_pulso();
 
-// --- VARIABLES DE TEMPORIZACIÓN ---
-unsigned long t_previo_hmi = 0;    // Para enviar datos a HMI
-unsigned long t_previo_read = 0; // Para leer datos de HMI
-
-// FUNCIONES ADICIONALES
-void contarPulso();
-
+// ==================================================
 void setup() {
-  Serial.begin(115200);  // Comunicación serial con el PC
-  Serial2.begin(115200); // Comunicación serial con el HMI
+  Serial.begin(115200);
+  Serial2.begin(115200);
 
-  // --- Configuración HMI ---
-  STONE_push_series("line_series", "line_series1", 0); // Gráfica 1 (Setpoint)
-  STONE_push_series("line_series", "line_series2", 0); // Gráfica 2 (RPM)
-  Stone_HMI_Set_Value("slider", "slider1", NULL, 0); // Poner slider en 0
-  HMI_init(); // Inicialización del sistema de colas
+  pinMode(pinPWM, OUTPUT);
+  pinMode(pinEncoder, INPUT);
+  analogWrite(pinPWM, 0);
 
-  // --- Configuración de Pines ---
-  pinMode(entrada, INPUT);
-  pinMode(pin_motor, OUTPUT);
-  analogWrite(pin_motor, 0); // Asegurarse que el motor esté apagado
+  // Inicialización HMI
+  Stone_HMI_Set_Value("slider", "slider1", NULL, 0);   // Slider (0-5000)
+  Stone_HMI_Set_Value("spin_box", "spin_box1", NULL, 0);   // Kp = 0
+  Stone_HMI_Set_Value("spin_box", "spin_box2", NULL, 0);   // Ki = 0
+  Stone_HMI_Set_Value("spin_box", "spin_box3", NULL, 0);   // Kd = 0
 
-  // --- Configuración de Interrupciones ---
-  // Interrupción de hardware para contar pulsos
-  attachInterrupt(digitalPinToInterrupt(entrada), contarPulso, FALLING);
-  
-  // Interrupción de Timer1 para el bucle de control (1 Hz)
+  // Configuración de las series
+  STONE_push_series("line_series", "line_series1", 0);
+  STONE_push_series("line_series", "line_series2", 0);
+  STONE_push_series("line_series", "line_series3", 0);
+
+  attachInterrupt(digitalPinToInterrupt(pinEncoder), ISR_pulso, FALLING);
+
+  // Timer1 modo CTC para el bucle PID (50 ms)
   noInterrupts();
-  TCCR1A = 0b00000000;  // Modo normal
-  TCCR1B = 0b00000000;  // Limpiar registros
-  TCCR1B |= B00000100;  // Preescaler 256
-  TIMSK1 |= B00000010;  // Habilitar interrupción por comparación (CTC)
-  OCR1A = 62500 / fs;   // TOP para 1 segundo (16MHz / 256 / 1Hz = 62500)
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCCR1B |= B00000100;    // prescaler 256
+  TIMSK1 |= B00000010;    // habilita interrupción por comparación A
+  OCR1A = 3125;           // 50 ms
   interrupts();
+
+  HMI_init();
 }
 
+// ==================================================
 void loop() {
-  // --- TAREA 1: Leer HMI (cada 10ms) ---
-  if (millis() - t_previo_read >= 10) {
-    t_previo_read = millis();
+  // Lectura HMI cada 10 ms
+  if (millis() - t_lecturaHMI >= 10) {
+    t_lecturaHMI = millis();
 
-    // 1. Leer Setpoint del slider (0-5000 RPM)
-    float slider_val = HMI_get_value("slider", "slider1");
-    if (slider_val > 0) {
-      setpoint_rpm = slider_val; // Asigna 0-5000 RPM
-      is_running = true;       // Si el usuario mueve el slider, arranca
+    // 1. Leemos el Setpoint (0-5000 RPM)
+    int slider_val = HMI_get_value("slider", "slider1");
+    if (slider_val >= 0) {
+      referenciaRPM = slider_val;
     }
 
-    // 2. Leer constantes PID de los spin_box
-    Kp = HMI_get_value("spin_box", "spin_box1");
-    Ki = HMI_get_value("spin_box", "spin_box2");
-    Kd = HMI_get_value("spin_box", "spin_box3");
-    
-    // 3. Leer botón de paro
-    int stop_button = HMI_get_value("tab_button", "tab_button1");
-    if (stop_button == 1) { // Asumiendo 1 = presionado
-      is_running = false;
-      setpoint_rpm = 0; // Poner setpoint a 0
-      Stone_HMI_Set_Value("slider", "slider1", NULL, 0); // Resetear slider en HMI
-    }
+    // 2. Leemos las constantes PID
+    float new_Kp = HMI_get_value("spin_box", "spin_box1");
+    float new_Ki = HMI_get_value("spin_box", "spin_box2");
+    float new_Kd = HMI_get_value("spin_box", "spin_box3");
+
+    // 3. Protegemos la escritura de las ganancias
+    noInterrupts();
+    if (new_Kp >= 0) Kp = new_Kp / 100.0;
+    if (new_Ki >= 0) Ki = new_Ki / 100.0;
+    if (new_Kd >= 0) Kd = new_Kd / 100.0;
+    interrupts();
   }
 
-  // --- TAREA 2: Escribir en HMI (cada 100ms) ---
-  if (millis() - t_previo_hmi >= 100) {
-    t_previo_hmi = millis();
+  // Envío HMI cada 100 ms
+  if (millis() - t_envioHMI >= 100) {
+    t_envioHMI = millis();
 
-    // Convertir valores a texto
-    dtostrf(setpoint_rpm, 7, 2, label12_text); // Valor deseado (del slider)
-    dtostrf(rpm, 7, 2, label4_text);           // Valor medido (RPM reales)
+    float rpm_actual;
+    float pid_actual;
 
-    // Enviar texto a etiquetas
-    Stone_HMI_Set_Text("label", "label12", label12_text); // Envía Setpoint a label12
-    Stone_HMI_Set_Text("label", "label4", label4_text);   // Envía RPM reales a label4
+    noInterrupts();
+    rpm_actual = velocidadRPM;
+    pid_actual = salidaPID;
+    interrupts();
 
-    // Enviar datos a las gráficas
-    STONE_push_series("line_series", "line_series1", setpoint_rpm); // Gráfica 1: Setpoint
-    STONE_push_series("line_series", "line_series2", rpm);          // Gráfica 2: RPM real
+    int duty_percent = (int)(pid_actual / 255.0 * 100.0);
+
+    dtostrf(referenciaRPM, 7, 2, txt_setpoint);
+    dtostrf(rpm_actual, 7, 2, txt_rpm);
+    dtostrf(duty_percent, 4, 0, txt_pwm);
+
+    Stone_HMI_Set_Text("label", "label12", txt_setpoint); 
+    Stone_HMI_Set_Text("label", "label4", txt_rpm);       
+    Stone_HMI_Set_Text("label", "label2", txt_pwm);     
+
+    STONE_push_series("line_series", "line_series1", duty_percent);
+    STONE_push_series("line_series", "line_series2", referenciaRPM);
+    STONE_push_series("line_series", "line_series3", (int)rpm_actual);
   }
 }
 
-
-// =================================================================
-// BUCLE DE CONTROL PID (Se ejecuta 1 vez por segundo)
-// =================================================================
+// ==================================================
+// BUCLE DE CONTROL (Se ejecuta cada 50ms)
+// ==================================================
 ISR(TIMER1_COMPA_vect) {
-  TCNT1 = 0; // Resetea el timer
+  TCNT1 = 0; // Reinicia el timer
+  
+  // 1. Calcular RPM
+  velocidadRPM = (float(pulsos) * 60.0 * fs) / (float)PPR;
+  pulsos = 0;
 
-  // --- 1. Calcular RPM (Variable de Proceso) ---
-  rpm = (float(conteo_pulsos) * 60) * fs / (PULSOS_POR_REV);
-  conteo_pulsos = 0; // Resetea los pulsos para el próximo segundo
+  // 2. Copias locales de las ganancias
+  noInterrupts();
+  float Kp_local = Kp;
+  float Ki_local = Ki;
+  float Kd_local = Kd;
+  interrupts();
+  
+  // 3. Actualización de errores
+  errorPID[2] = errorPID[1];
+  errorPID[1] = errorPID[0];
+  errorPID[0] = referenciaRPM - velocidadRPM;
 
-  // --- 2. Lógica de Paro ---
-  if (!is_running) {
-    output_pid = 0;     // Apagar salida
-    integral = 0;     // Resetear integral
-    last_error = 0;   // Resetear derivativa
-    analogWrite(pin_motor, 0); // Apagar motor
-    return; // Salir de la interrupción
+  // 4. PID incremental
+  float deltaU = Kp_local * (errorPID[0] - errorPID[1])
+               + (Ki_local * Ts) * errorPID[0]
+               + (Kd_local / Ts) * (errorPID[0] - 2 * errorPID[1] + errorPID[2]);
+  
+  salidaPID += deltaU;
+
+  // 5. Saturación
+  if (salidaPID > 255) salidaPID = 255;
+  if (salidaPID < 0)   salidaPID = 0;
+
+  // 6. Aplicar salida
+  if (referenciaRPM > 0) {
+    analogWrite(pinPWM, (int)salidaPID);
+  } else {
+    analogWrite(pinPWM, 0);
+    salidaPID = 0;
+    errorPID[0] = 0;
+    errorPID[1] = 0;
+    errorPID[2] = 0;
   }
-
-  // --- 3. Calcular Error ---
-  error = setpoint_rpm - rpm; // Ej: 3500 - 3450
-
-  // --- 4. Calcular Término Integral (con Anti-Windup) ---
-  integral = integral + (error * (1.0 / fs));
-  // Limitar (sujetar) la integral para evitar windup
-  if (integral > pid_max) integral = pid_max;
-  if (integral < pid_min) integral = pid_min;
-
-  // --- 5. Calcular Término Derivativo ---
-  derivative = (error - last_error) * fs;
-  last_error = error; // Guardar error actual para la próxima iteración
-
-  // --- 6. Calcular Salida PID ---
-  output_pid = (Kp * error) + (Ki * integral) + (Kd * derivative);
-
-  // --- 7. Saturar la Salida (0-255) ---
-  // A_A_quí el PID convierte el error grande (0-5000)
-  // en una salida de potencia (0-255)
-  if (output_pid > pid_max) output_pid = pid_max;
-  if (output_pid < pid_min) output_pid = pid_min;
-
-  // --- 8. Aplicar Salida al Motor ---
-  analogWrite(pin_motor, (int)output_pid);
-
-  // (Debug) Imprimir en el monitor serial
-  Serial.print("SP: "); Serial.print(setpoint_rpm);
-  Serial.print(" | RPM: "); Serial.print(rpm);
-  Serial.print(" | P: "); Serial.print(Kp * error);
-  Serial.print(" | I: "); Serial.print(Ki * integral);
-  Serial.print(" | D: "); Serial.print(Kd * derivative);
-  Serial.print(" | PWM: "); Serial.println(output_pid);
 }
 
-// =================================================================
-// Interrupción por Hardware para contar los pulsos del motor
-// =================================================================
-void contarPulso() {
-  conteo_pulsos++; // Incrementar contador al detectar pulso
+// ==================================================
+// Interrupción de Hardware (Encoder)
+// ==================================================
+void ISR_pulso() {
+  pulsos++;
 }
